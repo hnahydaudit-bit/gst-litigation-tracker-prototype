@@ -12,8 +12,14 @@ import matplotlib.pyplot as plt
 # ---------------- CONFIG ----------------
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-st.set_page_config(page_title="GST Litigation Tracker", page_icon="📂", layout="wide")
+st.set_page_config(
+    page_title="GST Litigation Tracker",
+    page_icon="📂",
+    layout="wide"
+)
+
 st.title("📂 GST Litigation Tracker")
+st.caption("Centralised Notice Intake, Tracking & Monitoring System")
 
 # ---------------- SESSION STORAGE ----------------
 if "notices" not in st.session_state:
@@ -33,14 +39,15 @@ def extract_with_ai(batch_texts):
     prompt = f"""
     You are an AI that extracts GST litigation notice details.
 
-    For each document, return a JSON array with these keys:
-    Entity Name, GSTIN, Type of Notice / Order, Description, Ref ID,
-    Date Of Issuance, Due Date, Case ID, Notice Type, Financial Year,
-    Total Demand Amount, DIN No, Officer Name, Designation,
-    Area Division, Tax Amount, Interest, Penalty, Source
+    Return a JSON array. Each object must contain:
+    Entity Name, GSTIN, Type of Notice / Order, Description,
+    Ref ID, Date Of Issuance, Due Date, Case ID,
+    Notice Type, Financial Year, Total Demand Amount,
+    DIN No, Officer Name, Designation, Area Division,
+    Tax Amount, Interest, Penalty, Source
 
-    If not found, leave blank.
-    Return ONLY valid JSON.
+    If a field is missing, leave it blank.
+    Return ONLY valid JSON. No explanation.
 
     Documents:
     {json.dumps(batch_texts)}
@@ -48,21 +55,21 @@ def extract_with_ai(batch_texts):
 
     model = genai.GenerativeModel("models/gemini-2.5-flash")
     response = model.generate_content(prompt)
-    text = response.candidates[0].content.parts[0].text
+    raw_text = response.candidates[0].content.parts[0].text
 
-    match = re.search(r"\[.*\]", text, re.DOTALL)
+    match = re.search(r"\[.*\]", raw_text, re.DOTALL)
     if not match:
         return []
 
     return json.loads(match.group(0))
 
-def add_status_defaults(data):
-    for d in data:
-        d["Status"] = "Pending"
-    return data
+def add_default_status(records):
+    for r in records:
+        r["Status"] = "Pending"
+    return records
 
-# ---------------- SECTION 1: UPLOAD ----------------
-st.header("📤 Upload GST Notice PDFs")
+# ---------------- SECTION 1: NOTICE INTAKE ----------------
+st.header("📤 Notice Intake")
 
 uploaded_files = st.file_uploader(
     "Upload GST Notice PDFs",
@@ -71,7 +78,7 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    with st.spinner("Processing notices..."):
+    with st.spinner("Reading notices and extracting details..."):
         batch_texts = []
 
         for uploaded in uploaded_files:
@@ -80,51 +87,55 @@ if uploaded_files:
                 tmp_path = tmp.name
 
             text = extract_text_from_pdf(tmp_path)
-            batch_texts.append({"Source": uploaded.name, "Text": text})
+            batch_texts.append({
+                "Source": uploaded.name,
+                "Text": text
+            })
+
             os.remove(tmp_path)
 
-        extracted = extract_with_ai(batch_texts)
-        extracted = add_status_defaults(extracted)
+        extracted_data = extract_with_ai(batch_texts)
+        extracted_data = add_default_status(extracted_data)
+        st.session_state.notices.extend(extracted_data)
 
-        st.session_state.notices.extend(extracted)
+    st.success("Notices successfully added to the register")
 
-    st.success("Notices processed and added to register")
-
-# ---------------- SECTION 2: REGISTER ----------------
+# ---------------- SECTION 2: NOTICE REGISTER ----------------
 st.header("📋 Notice Register")
 
 if st.session_state.notices:
     df = pd.DataFrame(st.session_state.notices)
 
-    # Status update
-    st.subheader("Update Notice Status")
+    st.subheader("Update Status")
     for i in range(len(df)):
-        new_status = st.selectbox(
-            f"{df.loc[i, 'Source']} ({df.loc[i, 'GSTIN']})",
-            STATUS_OPTIONS,
+        updated_status = st.selectbox(
+            label=f"{df.loc[i, 'Source']} | {df.loc[i, 'GSTIN']}",
+            options=STATUS_OPTIONS,
             index=STATUS_OPTIONS.index(df.loc[i, "Status"]),
             key=f"status_{i}"
         )
-        st.session_state.notices[i]["Status"] = new_status
+        st.session_state.notices[i]["Status"] = updated_status
 
     df = pd.DataFrame(st.session_state.notices)
+
+    st.subheader("All Notices")
     st.dataframe(df, use_container_width=True)
 
-    # Excel download
+    # -------- Excel Download --------
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         df.to_excel(writer, index=False, sheet_name="GST Notices")
     output.seek(0)
 
     st.download_button(
-        "📥 Download Excel Summary",
+        label="📥 Download Excel Summary",
         data=output,
         file_name="GST_Litigation_Register.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
     # ---------------- DASHBOARD ----------------
-    st.header("📊 Dashboard")
+    st.header("📊 Dashboard Overview")
 
     status_counts = df["Status"].value_counts()
 
@@ -134,19 +145,26 @@ if st.session_state.notices:
     col3.metric("Under Review", status_counts.get("Under Review", 0))
     col4.metric("Closed", status_counts.get("Closed", 0))
 
-    # Pie chart
-    fig, ax = plt.subplots()
-    ax.pie(
-        status_counts.values,
-        labels=status_counts.index,
-        autopct="%1.1f%%",
-        startangle=90
-    )
-    ax.axis("equal")
-    st.pyplot(fig)
+    st.subheader("Status Distribution")
+
+    _, chart_col = st.columns([2, 1])
+
+    with chart_col:
+        fig, ax = plt.subplots(figsize=(4, 4))
+        ax.pie(
+            status_counts.values,
+            labels=status_counts.index,
+            autopct="%1.0f%%",
+            startangle=90,
+            textprops={"fontsize": 9}
+        )
+        ax.set_title("Notices by Status", fontsize=11)
+        ax.axis("equal")
+        st.pyplot(fig, use_container_width=False)
 
 else:
-    st.info("No notices processed yet.")
+    st.info("No notices have been processed yet.")
+
 
 
 
