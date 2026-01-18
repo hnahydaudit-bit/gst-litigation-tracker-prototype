@@ -6,18 +6,22 @@ import tempfile
 import os
 import json
 import re
-from datetime import datetime
 from io import BytesIO
+import matplotlib.pyplot as plt
 
 # ---------------- CONFIG ----------------
-
-st.set_page_config(page_title="GST Litigation Tracker", page_icon="📂", layout="wide")
-st.title("📂 GST Litigation Tracker – Prototype")
-
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-# ---------------- HELPER FUNCTIONS ----------------
+st.set_page_config(page_title="GST Litigation Tracker", page_icon="📂", layout="wide")
+st.title("📂 GST Litigation Tracker")
 
+# ---------------- SESSION STORAGE ----------------
+if "notices" not in st.session_state:
+    st.session_state.notices = []
+
+STATUS_OPTIONS = ["Pending", "Under Review", "Replied", "Closed"]
+
+# ---------------- FUNCTIONS ----------------
 def extract_text_from_pdf(file_path):
     text = ""
     with fitz.open(file_path) as doc:
@@ -25,18 +29,18 @@ def extract_text_from_pdf(file_path):
             text += page.get_text("text")
     return text.strip()
 
-
 def extract_with_ai(batch_texts):
     prompt = f"""
-    Extract GST notice details and return ONLY valid JSON array.
+    You are an AI that extracts GST litigation notice details.
 
-    Required keys:
-    Entity Name, GSTIN, Notice Type, Description, Ref ID,
-    Date Of Issuance, Due Date, Financial Year,
-    Total Demand Amount, DIN No, Officer Name,
-    Designation, Area Division, Source
+    For each document, return a JSON array with these keys:
+    Entity Name, GSTIN, Type of Notice / Order, Description, Ref ID,
+    Date Of Issuance, Due Date, Case ID, Notice Type, Financial Year,
+    Total Demand Amount, DIN No, Officer Name, Designation,
+    Area Division, Tax Amount, Interest, Penalty, Source
 
-    If value not found, keep blank.
+    If not found, leave blank.
+    Return ONLY valid JSON.
 
     Documents:
     {json.dumps(batch_texts)}
@@ -52,106 +56,97 @@ def extract_with_ai(batch_texts):
 
     return json.loads(match.group(0))
 
+def add_status_defaults(data):
+    for d in data:
+        d["Status"] = "Pending"
+    return data
 
-def calculate_status(due_date):
-    try:
-        due = datetime.strptime(due_date, "%d-%m-%Y")
-        return "Overdue" if due < datetime.today() else "Pending"
-    except:
-        return "Pending"
+# ---------------- SECTION 1: UPLOAD ----------------
+st.header("📤 Upload GST Notice PDFs")
 
-# ---------------- SIDEBAR ----------------
-
-st.sidebar.header("📤 Upload Notices")
-
-uploaded_files = st.sidebar.file_uploader(
+uploaded_files = st.file_uploader(
     "Upload GST Notice PDFs",
     type=["pdf"],
     accept_multiple_files=True
 )
 
-# ---------------- MAIN LOGIC ----------------
-
 if uploaded_files:
-    st.info("⏳ Processing notices...")
+    with st.spinner("Processing notices..."):
+        batch_texts = []
 
-    batch_texts = []
+        for uploaded in uploaded_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(uploaded.read())
+                tmp_path = tmp.name
 
-    for uploaded in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(uploaded.read())
-            path = tmp.name
+            text = extract_text_from_pdf(tmp_path)
+            batch_texts.append({"Source": uploaded.name, "Text": text})
+            os.remove(tmp_path)
 
-        text = extract_text_from_pdf(path)
-        batch_texts.append({"Source": uploaded.name, "Text": text})
-        os.remove(path)
+        extracted = extract_with_ai(batch_texts)
+        extracted = add_status_defaults(extracted)
 
-    results = extract_with_ai(batch_texts)
+        st.session_state.notices.extend(extracted)
 
-    df = pd.DataFrame(results)
+    st.success("Notices processed and added to register")
 
-    if not df.empty:
-        # Add Status column
-        df["Status"] = df["Due Date"].apply(calculate_status)
+# ---------------- SECTION 2: REGISTER ----------------
+st.header("📋 Notice Register")
 
-        # ---------------- DASHBOARD ----------------
+if st.session_state.notices:
+    df = pd.DataFrame(st.session_state.notices)
 
-        col1, col2, col3, col4 = st.columns(4)
-
-        col1.metric("📄 Total Notices", len(df))
-        col2.metric("🕒 Pending", (df["Status"] == "Pending").sum())
-        col3.metric("⛔ Overdue", (df["Status"] == "Overdue").sum())
-        col4.metric("✅ Reviewed", (df["Status"] == "Reviewed").sum())
-
-        # ---------------- FILTERS ----------------
-
-        st.subheader("🔍 Filters")
-
-        f1, f2, f3 = st.columns(3)
-
-        notice_filter = f1.multiselect(
-            "Notice Type",
-            options=df["Notice Type"].dropna().unique()
+    # Status update
+    st.subheader("Update Notice Status")
+    for i in range(len(df)):
+        new_status = st.selectbox(
+            f"{df.loc[i, 'Source']} ({df.loc[i, 'GSTIN']})",
+            STATUS_OPTIONS,
+            index=STATUS_OPTIONS.index(df.loc[i, "Status"]),
+            key=f"status_{i}"
         )
+        st.session_state.notices[i]["Status"] = new_status
 
-        fy_filter = f2.multiselect(
-            "Financial Year",
-            options=df["Financial Year"].dropna().unique()
-        )
+    df = pd.DataFrame(st.session_state.notices)
+    st.dataframe(df, use_container_width=True)
 
-        status_filter = f3.multiselect(
-            "Status",
-            options=df["Status"].unique()
-        )
+    # Excel download
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="GST Notices")
+    output.seek(0)
 
-        if notice_filter:
-            df = df[df["Notice Type"].isin(notice_filter)]
-        if fy_filter:
-            df = df[df["Financial Year"].isin(fy_filter)]
-        if status_filter:
-            df = df[df["Status"].isin(status_filter)]
+    st.download_button(
+        "📥 Download Excel Summary",
+        data=output,
+        file_name="GST_Litigation_Register.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-        # ---------------- TABLE ----------------
+    # ---------------- DASHBOARD ----------------
+    st.header("📊 Dashboard")
 
-        st.subheader("📑 Litigation Register")
-        st.dataframe(df, use_container_width=True)
+    status_counts = df["Status"].value_counts()
 
-        # ---------------- EXCEL DOWNLOAD ----------------
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Notices", len(df))
+    col2.metric("Pending", status_counts.get("Pending", 0))
+    col3.metric("Under Review", status_counts.get("Under Review", 0))
+    col4.metric("Closed", status_counts.get("Closed", 0))
 
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="GST Notices")
+    # Pie chart
+    fig, ax = plt.subplots()
+    ax.pie(
+        status_counts.values,
+        labels=status_counts.index,
+        autopct="%1.1f%%",
+        startangle=90
+    )
+    ax.axis("equal")
+    st.pyplot(fig)
 
-        output.seek(0)
+else:
+    st.info("No notices processed yet.")
 
-        st.download_button(
-            "📥 Download Excel",
-            data=output,
-            file_name="GST_Litigation_Tracker.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-
-    else:
-        st.warning("No data extracted from notices.")
 
 
