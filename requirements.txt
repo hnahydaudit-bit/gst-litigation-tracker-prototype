@@ -3,4 +3,5 @@ pandas
 PyMuPDF
 google-generativeai
 xlsxwriter
+matplotlib
 
