@@ -154,3 +154,4 @@ if uploaded_files:
     else:
         st.warning("No data extracted from notices.")
 
+
