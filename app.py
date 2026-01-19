@@ -1,73 +1,80 @@
 import streamlit as st
 import pandas as pd
-import fitz
+import fitz  # PyMuPDF
 import google.generativeai as genai
 import tempfile
 import os
 import json
 import re
 from io import BytesIO
-import matplotlib.pyplot as plt
+import plotly.express as px
+from datetime import datetime
 
 # ---------------- CONFIG ----------------
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-
 st.set_page_config(
     page_title="GST Litigation Tracker",
     page_icon="📂",
     layout="wide"
 )
 
-st.title("📂 GST Litigation Tracker")
-st.caption("Centralised GST Notice Intake, Tracking & Monitoring")
+genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
-STATUS_OPTIONS = ["Pending", "Under Review", "Replied", "Closed"]
-
-# ---------------- SESSION ----------------
+# ---------------- SESSION STATE ----------------
 if "notices" not in st.session_state:
     st.session_state.notices = []
 
-if "show_register" not in st.session_state:
-    st.session_state.show_register = False
+if "latest_upload" not in st.session_state:
+    st.session_state.latest_upload = pd.DataFrame()
 
-# ---------------- FUNCTIONS ----------------
-def extract_text_from_pdf(file_path):
+# ---------------- HELPERS ----------------
+def extract_text_from_pdf(path):
     text = ""
-    with fitz.open(file_path) as doc:
+    with fitz.open(path) as doc:
         for page in doc:
-            text += page.get_text("text")
+            text += page.get_text()
     return text.strip()
 
 def extract_with_ai(batch_texts):
     prompt = f"""
-    Extract GST notice details and return ONLY valid JSON array.
+    Extract GST litigation notice details.
 
-    Fields:
-    Entity Name, GSTIN, Notice Type, Financial Year, Ref ID,
-    Date Of Issuance, Due Date, Total Demand Amount,
-    Officer Name, Designation, Area Division,
+    Return ONLY a JSON array with keys:
+    Entity Name, GSTIN, Type of Notice / Order (System Update),
+    Description, Ref ID, Date Of Issuance, Due Date, Case ID,
+    Notice Type (ASMT-10 or ADT - 01 / SCN or Appeal),
+    Financial Year, Total Demand Amount as per Notice,
+    DIN No, Officer Name, Designation, Area Division,
     Tax Amount, Interest, Penalty, Source
 
-    If missing, leave blank.
+    If not found, leave blank.
 
     Documents:
-    {json.dumps(batch_texts)}
+    {json.dumps(batch_texts, indent=2)}
     """
 
     model = genai.GenerativeModel("models/gemini-2.5-flash")
     response = model.generate_content(prompt)
-    raw = response.candidates[0].content.parts[0].text
+    text = response.candidates[0].content.parts[0].text
 
-    match = re.search(r"\[.*\]", raw, re.DOTALL)
+    match = re.search(r"\[.*\]", text, re.DOTALL)
     return json.loads(match.group(0)) if match else []
 
-def add_default_status(data):
+def add_defaults(data):
     for d in data:
         d["Status"] = "Pending"
+        d["Last Updated"] = datetime.now().strftime("%d-%m-%Y")
     return data
 
-# ---------------- SECTION 1: UPLOAD ----------------
-st.header("📤 Notice Intake")
+# ---------------- UI ----------------
+st.title("📂 GST Litigation Tracker")
+
+st.markdown(
+    "Automated GST notice extraction, tracking & status monitoring",
+    unsafe_allow_html=True
+)
+
+# ---------------- UPLOAD SECTION ----------------
+st.subheader("📤 Upload GST Notices")
 
 uploaded_files = st.file_uploader(
     "Upload GST Notice PDFs",
@@ -79,108 +86,121 @@ if uploaded_files:
     with st.spinner("Processing notices..."):
         batch_texts = []
 
-        for uploaded in uploaded_files:
+        for file in uploaded_files:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(uploaded.read())
+                tmp.write(file.read())
                 path = tmp.name
 
-            batch_texts.append({
-                "Source": uploaded.name,
-                "Text": extract_text_from_pdf(path)
-            })
+            text = extract_text_from_pdf(path)
+            batch_texts.append({"Source": file.name, "Text": text})
             os.remove(path)
 
-        extracted = add_default_status(extract_with_ai(batch_texts))
+        extracted = add_defaults(extract_with_ai(batch_texts))
+        latest_df = pd.DataFrame(extracted)
+
+        st.session_state.latest_upload = latest_df
         st.session_state.notices.extend(extracted)
 
-    st.success("Notices added successfully")
+    st.success("Notices processed successfully")
 
-# ---------------- MAIN DASHBOARD ----------------
+    # -------- CURRENT UPLOAD OUTPUT --------
+    st.subheader("📄 Current Upload Summary")
+    st.dataframe(latest_df, use_container_width=True)
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+        latest_df.to_excel(writer, index=False, sheet_name="Summary")
+    buffer.seek(0)
+
+    st.download_button(
+        "📥 Download Excel (This Upload)",
+        data=buffer,
+        file_name="GST_Notice_Summary_Current_Upload.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+# ---------------- DASHBOARD ----------------
 if st.session_state.notices:
     df = pd.DataFrame(st.session_state.notices)
-    status_counts = df["Status"].value_counts()
 
-    st.header("📊 Dashboard")
-
-    # -------- KPIs --------
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total Notices", len(df))
-    k2.metric("Pending", status_counts.get("Pending", 0))
-    k3.metric("Under Review", status_counts.get("Under Review", 0))
-    k4.metric("Closed", status_counts.get("Closed", 0))
-
-    dash_col, side_col = st.columns([1.2, 1])
-
-    # -------- PIE CHART (SMALL & CLEAN) --------
-    with dash_col:
-        fig, ax = plt.subplots(figsize=(3.4, 3.4))
-        colors = ["#1a73e8", "#4285f4", "#8ab4f8", "#e8f0fe"]
-
-        ax.pie(
-            status_counts.values,
-            labels=status_counts.index,
-            autopct="%1.0f%%",
-            startangle=90,
-            colors=colors[:len(status_counts)],
-            textprops={"fontsize": 8}
-        )
-        ax.set_title("Notice Status Distribution", fontsize=10)
-        ax.axis("equal")
-        plt.tight_layout()
-        st.pyplot(fig)
-
-    # -------- STATUS EDIT (FAST) --------
-    with side_col:
-        st.subheader("✏️ Update Notice Status")
-
-        labels = [
-            f"{i+1}. {row.get('Source','')} | {row.get('GSTIN','')}"
-            for i, row in df.iterrows()
-        ]
-
-        with st.form("status_form", clear_on_submit=False):
-            idx = st.selectbox(
-                "Select Notice",
-                range(len(labels)),
-                format_func=lambda x: labels[x]
-            )
-
-            new_status = st.selectbox(
-                "New Status",
-                STATUS_OPTIONS,
-                index=STATUS_OPTIONS.index(df.loc[idx, "Status"])
-            )
-
-            submit = st.form_submit_button("Update Status")
-
-            if submit:
-                st.session_state.notices[idx]["Status"] = new_status
-                st.success("Status updated instantly")
-
-    # -------- NOTICE HISTORY BUTTON --------
     st.divider()
+    st.subheader("📊 Litigation Dashboard")
 
-    if st.button("📂 View Notice History"):
-        st.session_state.show_register = not st.session_state.show_register
+    col1, col2, col3 = st.columns([1, 1, 2])
 
-    if st.session_state.show_register:
-        with st.expander("Notice Register", expanded=True):
-            st.dataframe(df, use_container_width=True)
+    with col1:
+        st.metric("Total Notices", len(df))
 
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="GST Notices")
-            output.seek(0)
+    with col2:
+        st.metric(
+            "Pending",
+            int((df["Status"] == "Pending").sum())
+        )
 
-            st.download_button(
-                "📥 Download Excel Summary",
-                data=output,
-                file_name="GST_Litigation_Register.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    with col3:
+        pie = df["Status"].value_counts().reset_index()
+        pie.columns = ["Status", "Count"]
 
-else:
-    st.info("Upload GST notices to start tracking.")
+        fig = px.pie(
+            pie,
+            values="Count",
+            names="Status",
+            hole=0.55,
+            color_discrete_sequence=px.colors.sequential.Blues
+        )
+
+        fig.update_layout(
+            height=280,
+            margin=dict(t=10, b=10, l=10, r=10),
+            showlegend=True
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+# ---------------- NOTICE HISTORY ----------------
+st.divider()
+
+if st.button("📂 View / Update Notice Register"):
+    st.subheader("📁 Notice Register")
+
+    df = pd.DataFrame(st.session_state.notices)
+
+    # --- SMART FILTER ---
+    filter_status = st.selectbox(
+        "Filter by Status",
+        ["All", "Pending", "In Progress", "Replied", "Closed"]
+    )
+
+    view_df = df if filter_status == "All" else df[df["Status"] == filter_status]
+
+    st.dataframe(view_df, use_container_width=True)
+
+    # --- STATUS UPDATE (FAST & CLEAN) ---
+    st.subheader("✏️ Update Notice Status")
+
+    selected_ref = st.selectbox(
+        "Select Ref ID",
+        view_df["Ref ID"].dropna().unique()
+    )
+
+    new_status = st.selectbox(
+        "New Status",
+        ["Pending", "In Progress", "Replied", "Closed"]
+    )
+
+    if st.button("Update Status"):
+        for n in st.session_state.notices:
+            if n.get("Ref ID") == selected_ref:
+                n["Status"] = new_status
+                n["Last Updated"] = datetime.now().strftime("%d-%m-%Y")
+        st.success("Status updated successfully")
+        st.rerun()
+
+# ---------------- FOOTER ----------------
+st.caption(
+    "Prototype | API-ready | Confidential processing recommended via Enterprise AI"
+)
+
 
 
 
