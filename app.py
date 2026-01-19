@@ -7,8 +7,8 @@ import os
 import json
 import re
 from io import BytesIO
-import plotly.express as px
 from datetime import datetime
+import altair as alt
 
 # ---------------- CONFIG ----------------
 st.set_page_config(
@@ -67,13 +67,9 @@ def add_defaults(data):
 
 # ---------------- UI ----------------
 st.title("📂 GST Litigation Tracker")
+st.caption("Automated GST notice extraction & litigation management")
 
-st.markdown(
-    "Automated GST notice extraction, tracking & status monitoring",
-    unsafe_allow_html=True
-)
-
-# ---------------- UPLOAD SECTION ----------------
+# ---------------- UPLOAD ----------------
 st.subheader("📤 Upload GST Notices")
 
 uploaded_files = st.file_uploader(
@@ -103,13 +99,13 @@ if uploaded_files:
 
     st.success("Notices processed successfully")
 
-    # -------- CURRENT UPLOAD OUTPUT --------
+    # -------- CURRENT UPLOAD --------
     st.subheader("📄 Current Upload Summary")
     st.dataframe(latest_df, use_container_width=True)
 
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        latest_df.to_excel(writer, index=False, sheet_name="Summary")
+        latest_df.to_excel(writer, index=False)
     buffer.seek(0)
 
     st.download_button(
@@ -126,38 +122,36 @@ if st.session_state.notices:
     st.divider()
     st.subheader("📊 Litigation Dashboard")
 
-    col1, col2, col3 = st.columns([1, 1, 2])
+    c1, c2, c3 = st.columns([1, 1, 2])
 
-    with col1:
+    with c1:
         st.metric("Total Notices", len(df))
 
-    with col2:
-        st.metric(
-            "Pending",
-            int((df["Status"] == "Pending").sum())
+    with c2:
+        st.metric("Pending", int((df["Status"] == "Pending").sum()))
+
+    with c3:
+        pie_df = df["Status"].value_counts().reset_index()
+        pie_df.columns = ["Status", "Count"]
+
+        chart = (
+            alt.Chart(pie_df)
+            .mark_arc(innerRadius=70)
+            .encode(
+                theta="Count:Q",
+                color=alt.Color(
+                    "Status:N",
+                    scale=alt.Scale(scheme="blues"),
+                    legend=alt.Legend(title="Status")
+                ),
+                tooltip=["Status", "Count"]
+            )
+            .properties(height=250)
         )
 
-    with col3:
-        pie = df["Status"].value_counts().reset_index()
-        pie.columns = ["Status", "Count"]
+        st.altair_chart(chart, use_container_width=True)
 
-        fig = px.pie(
-            pie,
-            values="Count",
-            names="Status",
-            hole=0.55,
-            color_discrete_sequence=px.colors.sequential.Blues
-        )
-
-        fig.update_layout(
-            height=280,
-            margin=dict(t=10, b=10, l=10, r=10),
-            showlegend=True
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-# ---------------- NOTICE HISTORY ----------------
+# ---------------- NOTICE REGISTER ----------------
 st.divider()
 
 if st.button("📂 View / Update Notice Register"):
@@ -165,17 +159,15 @@ if st.button("📂 View / Update Notice Register"):
 
     df = pd.DataFrame(st.session_state.notices)
 
-    # --- SMART FILTER ---
-    filter_status = st.selectbox(
+    status_filter = st.selectbox(
         "Filter by Status",
         ["All", "Pending", "In Progress", "Replied", "Closed"]
     )
 
-    view_df = df if filter_status == "All" else df[df["Status"] == filter_status]
+    view_df = df if status_filter == "All" else df[df["Status"] == status_filter]
 
     st.dataframe(view_df, use_container_width=True)
 
-    # --- STATUS UPDATE (FAST & CLEAN) ---
     st.subheader("✏️ Update Notice Status")
 
     selected_ref = st.selectbox(
@@ -197,9 +189,8 @@ if st.button("📂 View / Update Notice Register"):
         st.rerun()
 
 # ---------------- FOOTER ----------------
-st.caption(
-    "Prototype | API-ready | Confidential processing recommended via Enterprise AI"
-)
+st.caption("Prototype | Free tools | API-ready architecture")
+
 
 
 
