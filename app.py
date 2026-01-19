@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import fitz  # PyMuPDF
+import fitz
 import google.generativeai as genai
 import tempfile
 import os
@@ -20,8 +20,8 @@ st.set_page_config(
 genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
 
 # ---------------- SESSION STATE ----------------
-if "notices" not in st.session_state:
-    st.session_state.notices = []
+if "notices_df" not in st.session_state:
+    st.session_state.notices_df = pd.DataFrame()
 
 if "latest_upload" not in st.session_state:
     st.session_state.latest_upload = pd.DataFrame()
@@ -46,7 +46,7 @@ def extract_with_ai(batch_texts):
     DIN No, Officer Name, Designation, Area Division,
     Tax Amount, Interest, Penalty, Source
 
-    If not found, leave blank.
+    Leave blank if not found.
 
     Documents:
     {json.dumps(batch_texts, indent=2)}
@@ -59,17 +59,16 @@ def extract_with_ai(batch_texts):
     match = re.search(r"\[.*\]", text, re.DOTALL)
     return json.loads(match.group(0)) if match else []
 
-def add_defaults(data):
-    for d in data:
-        d["Status"] = "Pending"
-        d["Last Updated"] = datetime.now().strftime("%d-%m-%Y")
-    return data
+def add_defaults(df):
+    df["Status"] = "Pending"
+    df["Last Updated"] = datetime.now().strftime("%d-%m-%Y")
+    return df
 
 # ---------------- UI ----------------
 st.title("📂 GST Litigation Tracker")
 st.caption("Automated GST notice extraction & litigation management")
 
-# ---------------- UPLOAD ----------------
+# ---------------- UPLOAD SECTION ----------------
 st.subheader("📤 Upload GST Notices")
 
 uploaded_files = st.file_uploader(
@@ -91,15 +90,23 @@ if uploaded_files:
             batch_texts.append({"Source": file.name, "Text": text})
             os.remove(path)
 
-        extracted = add_defaults(extract_with_ai(batch_texts))
+        extracted = extract_with_ai(batch_texts)
         latest_df = pd.DataFrame(extracted)
+        latest_df = add_defaults(latest_df)
 
         st.session_state.latest_upload = latest_df
-        st.session_state.notices.extend(extracted)
+
+        if st.session_state.notices_df.empty:
+            st.session_state.notices_df = latest_df
+        else:
+            st.session_state.notices_df = pd.concat(
+                [st.session_state.notices_df, latest_df],
+                ignore_index=True
+            )
 
     st.success("Notices processed successfully")
 
-    # -------- CURRENT UPLOAD --------
+    # ---- CURRENT UPLOAD SUMMARY ----
     st.subheader("📄 Current Upload Summary")
     st.dataframe(latest_df, use_container_width=True)
 
@@ -116,8 +123,8 @@ if uploaded_files:
     )
 
 # ---------------- DASHBOARD ----------------
-if st.session_state.notices:
-    df = pd.DataFrame(st.session_state.notices)
+if not st.session_state.notices_df.empty:
+    df = st.session_state.notices_df
 
     st.divider()
     st.subheader("📊 Litigation Dashboard")
@@ -134,9 +141,9 @@ if st.session_state.notices:
         pie_df = df["Status"].value_counts().reset_index()
         pie_df.columns = ["Status", "Count"]
 
-        chart = (
+        pie_chart = (
             alt.Chart(pie_df)
-            .mark_arc(innerRadius=70)
+            .mark_arc()
             .encode(
                 theta="Count:Q",
                 color=alt.Color(
@@ -146,10 +153,10 @@ if st.session_state.notices:
                 ),
                 tooltip=["Status", "Count"]
             )
-            .properties(height=250)
+            .properties(height=220)
         )
 
-        st.altair_chart(chart, use_container_width=True)
+        st.altair_chart(pie_chart, use_container_width=True)
 
 # ---------------- NOTICE REGISTER ----------------
 st.divider()
@@ -157,39 +164,38 @@ st.divider()
 if st.button("📂 View / Update Notice Register"):
     st.subheader("📁 Notice Register")
 
-    df = pd.DataFrame(st.session_state.notices)
+    df = st.session_state.notices_df
 
-    status_filter = st.selectbox(
+    filter_status = st.selectbox(
         "Filter by Status",
         ["All", "Pending", "In Progress", "Replied", "Closed"]
     )
 
-    view_df = df if status_filter == "All" else df[df["Status"] == status_filter]
+    view_df = df if filter_status == "All" else df[df["Status"] == filter_status]
 
     st.dataframe(view_df, use_container_width=True)
 
     st.subheader("✏️ Update Notice Status")
 
-    selected_ref = st.selectbox(
-        "Select Ref ID",
-        view_df["Ref ID"].dropna().unique()
-    )
+    ref_list = view_df["Ref ID"].dropna().unique()
 
-    new_status = st.selectbox(
-        "New Status",
-        ["Pending", "In Progress", "Replied", "Closed"]
-    )
+    if len(ref_list) > 0:
+        selected_ref = st.selectbox("Select Ref ID", ref_list)
+        new_status = st.selectbox(
+            "New Status",
+            ["Pending", "In Progress", "Replied", "Closed"]
+        )
 
-    if st.button("Update Status"):
-        for n in st.session_state.notices:
-            if n.get("Ref ID") == selected_ref:
-                n["Status"] = new_status
-                n["Last Updated"] = datetime.now().strftime("%d-%m-%Y")
-        st.success("Status updated successfully")
-        st.rerun()
+        if st.button("Update Status"):
+            idx = st.session_state.notices_df[
+                st.session_state.notices_df["Ref ID"] == selected_ref
+            ].index
 
-# ---------------- FOOTER ----------------
-st.caption("Prototype | Free tools | API-ready architecture")
+            st.session_state.notices_df.loc[idx, "Status"] = new_status
+            st.session_state.notices_df.loc[idx, "Last Updated"] = datetime.now().strftime("%d-%m-%Y")
+
+            st.success("Status updated successfully")
+
 
 
 
