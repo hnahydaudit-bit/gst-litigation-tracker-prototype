@@ -45,11 +45,6 @@ def extract_with_ai(batch_texts):
     Financial Year, Total Demand Amount as per Notice,
     DIN No, Officer Name, Designation, Area Division,
     Tax Amount, Interest, Penalty, Source
-
-    Leave blank if not found.
-
-    Documents:
-    {json.dumps(batch_texts, indent=2)}
     """
 
     model = genai.GenerativeModel("models/gemini-2.5-flash")
@@ -66,9 +61,8 @@ def add_defaults(df):
 
 # ---------------- UI ----------------
 st.title("📂 GST Litigation Tracker")
-st.caption("Automated GST notice extraction & litigation management")
 
-# ---------------- UPLOAD SECTION ----------------
+# ---------------- UPLOAD ----------------
 st.subheader("📤 Upload GST Notices")
 
 uploaded_files = st.file_uploader(
@@ -86,33 +80,47 @@ if uploaded_files:
                 tmp.write(file.read())
                 path = tmp.name
 
-            text = extract_text_from_pdf(path)
+            text = extract_text_from_pdf(path)[:12000]  # token safety
             batch_texts.append({"Source": file.name, "Text": text})
             os.remove(path)
 
         extracted = extract_with_ai(batch_texts)
-        latest_df = pd.DataFrame(extracted)
-        latest_df = add_defaults(latest_df)
+        new_df = pd.DataFrame(extracted)
+        new_df = add_defaults(new_df)
 
-        st.session_state.latest_upload = latest_df
-
+        # --------- MERGE LOGIC (NO DUPLICATES) ---------
         if st.session_state.notices_df.empty:
-            st.session_state.notices_df = latest_df
+            st.session_state.notices_df = new_df
         else:
-            st.session_state.notices_df = pd.concat(
-                [st.session_state.notices_df, latest_df],
-                ignore_index=True
-            )
+            existing = st.session_state.notices_df
+
+            for _, row in new_df.iterrows():
+                ref = row["Ref ID"]
+
+                if ref in existing["Ref ID"].values:
+                    idx = existing[existing["Ref ID"] == ref].index
+                    for col in new_df.columns:
+                        if col not in ["Status", "Last Updated"]:
+                            existing.loc[idx, col] = row[col]
+                else:
+                    existing = pd.concat(
+                        [existing, row.to_frame().T],
+                        ignore_index=True
+                    )
+
+            st.session_state.notices_df = existing
+
+        st.session_state.latest_upload = new_df
 
     st.success("Notices processed successfully")
 
-    # ---- CURRENT UPLOAD SUMMARY ----
+    # -------- CURRENT UPLOAD --------
     st.subheader("📄 Current Upload Summary")
-    st.dataframe(latest_df, use_container_width=True)
+    st.dataframe(new_df, use_container_width=True)
 
     buffer = BytesIO()
     with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
-        latest_df.to_excel(writer, index=False)
+        new_df.to_excel(writer, index=False)
     buffer.seek(0)
 
     st.download_button(
@@ -141,60 +149,42 @@ if not st.session_state.notices_df.empty:
         pie_df = df["Status"].value_counts().reset_index()
         pie_df.columns = ["Status", "Count"]
 
-        pie_chart = (
+        chart = (
             alt.Chart(pie_df)
             .mark_arc()
             .encode(
                 theta="Count:Q",
-                color=alt.Color(
-                    "Status:N",
-                    scale=alt.Scale(scheme="blues"),
-                    legend=alt.Legend(title="Status")
-                ),
+                color=alt.Color("Status:N", scale=alt.Scale(scheme="blues")),
                 tooltip=["Status", "Count"]
             )
             .properties(height=220)
         )
 
-        st.altair_chart(pie_chart, use_container_width=True)
+        st.altair_chart(chart, use_container_width=True)
 
 # ---------------- NOTICE REGISTER ----------------
 st.divider()
 
 if st.button("📂 View / Update Notice Register"):
-    st.subheader("📁 Notice Register")
-
     df = st.session_state.notices_df
 
-    filter_status = st.selectbox(
-        "Filter by Status",
-        ["All", "Pending", "In Progress", "Replied", "Closed"]
+    st.subheader("📁 Notice Register")
+    st.dataframe(df, use_container_width=True)
+
+    st.subheader("✏️ Update Status")
+
+    ref_id = st.selectbox("Select Ref ID", df["Ref ID"].dropna().unique())
+    new_status = st.selectbox(
+        "New Status",
+        ["Pending", "In Progress", "Replied", "Closed"]
     )
 
-    view_df = df if filter_status == "All" else df[df["Status"] == filter_status]
+    if st.button("Update Status"):
+        idx = df[df["Ref ID"] == ref_id].index
+        st.session_state.notices_df.loc[idx, "Status"] = new_status
+        st.session_state.notices_df.loc[idx, "Last Updated"] = datetime.now().strftime("%d-%m-%Y")
+        st.success("Status updated successfully")
 
-    st.dataframe(view_df, use_container_width=True)
-
-    st.subheader("✏️ Update Notice Status")
-
-    ref_list = view_df["Ref ID"].dropna().unique()
-
-    if len(ref_list) > 0:
-        selected_ref = st.selectbox("Select Ref ID", ref_list)
-        new_status = st.selectbox(
-            "New Status",
-            ["Pending", "In Progress", "Replied", "Closed"]
-        )
-
-        if st.button("Update Status"):
-            idx = st.session_state.notices_df[
-                st.session_state.notices_df["Ref ID"] == selected_ref
-            ].index
-
-            st.session_state.notices_df.loc[idx, "Status"] = new_status
-            st.session_state.notices_df.loc[idx, "Last Updated"] = datetime.now().strftime("%d-%m-%Y")
-
-            st.success("Status updated successfully")
 
 
 
