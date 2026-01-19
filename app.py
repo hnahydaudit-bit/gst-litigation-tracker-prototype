@@ -6,13 +6,18 @@ import tempfile
 import os
 import json
 import re
+import io
 from datetime import datetime
 
 # ================= CONFIG =================
 st.set_page_config(page_title="GST Litigation Tracker", layout="wide")
 st.title("📂 GST Litigation Tracker")
 
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+# Secure API Key handling
+if "GEMINI_API_KEY" in st.secrets:
+    genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+else:
+    st.error("Please set GEMINI_API_KEY in your Streamlit secrets.")
 
 STATUS_OPTIONS = ["Pending", "Under Review", "Replied", "Closed"]
 
@@ -23,56 +28,48 @@ if "notice_register" not in st.session_state:
 # ================= HELPERS =================
 def extract_text_from_pdf(path):
     text = ""
-    with fitz.open(path) as doc:
-        for page in doc:
-            text += page.get_text()
+    try:
+        with fitz.open(path) as doc:
+            for page in doc:
+                text += page.get_text()
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
     return text.strip()
 
+def to_excel(df):
+    """Converts dataframe to an excel binary stream"""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+    return output.getvalue()
 
 def extract_with_ai_batch(batch_texts):
     prompt = f"""
 You are a GST litigation expert.
-
-Extract data STRICTLY from text.
-DO NOT GUESS OR FILL DUMMY VALUES.
-If not found, use null.
-
-Return ONLY valid JSON array.
+Extract data STRICTLY from text. Return ONLY a valid JSON array.
+If a field is not found, use null.
 
 Fields:
-- Entity Name
-- GSTIN
-- Type of Notice / Order
-- Description
-- Ref ID
-- Date Of Issuance
-- Due Date
-- Case ID
-- Notice Type
-- Financial Year
-- Total Demand Amount
-- DIN No
-- Officer Name
-- Designation
-- Area Division
-- Tax Amount
-- Interest
-- Penalty
-- Source
+- Entity Name, GSTIN, Type of Notice / Order, Description, Ref ID, 
+- Date Of Issuance, Due Date, Case ID, Notice Type, Financial Year, 
+- Total Demand Amount, DIN No, Officer Name, Designation, Area Division, 
+- Tax Amount, Interest, Penalty, Source
 
 DOCUMENTS:
 {json.dumps(batch_texts, indent=2)}
 """
-
-    model = genai.GenerativeModel("models/gemini-2.5-flash")
-    response = model.generate_content(prompt)
-
-    match = re.search(r"\[.*\]", response.text, re.DOTALL)
-    if not match:
-        return []
-
-    return json.loads(match.group(0))
-
+    # Using gemini-1.5-flash (the current stable flash model)
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    
+    try:
+        response = model.generate_content(prompt)
+        # Clean the response to ensure it only contains the JSON array
+        clean_json = re.search(r"\[.*\]", response.text, re.DOTALL)
+        if clean_json:
+            return json.loads(clean_json.group(0))
+    except Exception as e:
+        st.error(f"AI Extraction Error: {e}")
+    return []
 
 # ================= UPLOAD SECTION =================
 st.subheader("📤 Upload GST Notices")
@@ -84,73 +81,72 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    with st.spinner("Extracting notice details..."):
-        batch_texts = []
+    if st.button("Process Documents"):
+        with st.spinner("Extracting notice details..."):
+            batch_texts = []
 
-        for file in uploaded_files:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                tmp.write(file.read())
-                path = tmp.name
+            for file in uploaded_files:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                    tmp.write(file.getvalue())
+                    path = tmp.name
 
-            text = extract_text_from_pdf(path)
-            os.remove(path)
+                text = extract_text_from_pdf(path)
+                os.remove(path)
 
-            if text:
-                batch_texts.append({
-                    "Source": file.name,
-                    "text": text[:8000]  # safe limit
-                })
+                if text:
+                    batch_texts.append({
+                        "Source": file.name,
+                        "text": text[:8000]  # Chunking to fit context limits
+                    })
 
-        extracted = extract_with_ai_batch(batch_texts)
+            if batch_texts:
+                extracted = extract_with_ai_batch(batch_texts)
 
-        if extracted:
-            df_new = pd.DataFrame(extracted)
-            df_new["Status"] = "Pending"
-            df_new["Last Updated"] = datetime.now().strftime("%d-%m-%Y %H:%M")
+                if extracted:
+                    df_new = pd.DataFrame(extracted)
+                    df_new["Status"] = "Pending"
+                    df_new["Last Updated"] = datetime.now().strftime("%d-%m-%Y %H:%M")
 
-            st.session_state.notice_register = pd.concat(
-                [st.session_state.notice_register, df_new],
-                ignore_index=True
-            )
+                    st.session_state.notice_register = pd.concat(
+                        [st.session_state.notice_register, df_new],
+                        ignore_index=True
+                    )
 
-            st.success("Notices processed successfully")
+                    st.success(f"Successfully processed {len(df_new)} notices!")
+                    
+                    st.subheader("📄 Current Upload Summary")
+                    st.dataframe(df_new, use_container_width=True)
 
-            st.subheader("📄 Current Upload Summary")
-            st.dataframe(df_new, use_container_width=True)
-
-            st.download_button(
-                "📥 Download Excel (This Upload)",
-                df_new.to_excel(index=False),
-                file_name="GST_Notice_Summary.xlsx"
-            )
+                    excel_data = to_excel(df_new)
+                    st.download_button(
+                        label="📥 Download Excel (This Upload)",
+                        data=excel_data,
+                        file_name=f"Notice_Summary_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
 # ================= DASHBOARD =================
 if not st.session_state.notice_register.empty:
     st.divider()
     st.subheader("📊 Notice Status Overview")
 
-    status_counts = (
-        st.session_state.notice_register["Status"]
-        .value_counts()
-        .reset_index()
-    )
-    status_counts.columns = ["Status", "Count"]
-
+    df_reg = st.session_state.notice_register
+    
     col1, col2 = st.columns([1, 2])
 
     with col1:
-        st.metric("Total Notices", len(st.session_state.notice_register))
+        st.metric("Total Notices", len(df_reg))
+        status_counts = df_reg["Status"].value_counts()
+        st.write(status_counts)
 
     with col2:
-        st.pyplot(
-            status_counts.set_index("Status").plot(
-                kind="pie",
-                y="Count",
-                legend=False,
-                autopct="%1.0f%%",
-                figsize=(4, 4)
-            ).get_figure()
-        )
+        # Simple Pie Chart using Streamlit Native if Matplotlib is complex
+        if not status_counts.empty:
+            import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(figsize=(4, 4))
+            status_counts.plot(kind='pie', autopct='%1.0f%%', ax=ax, startangle=90)
+            ax.set_ylabel('')
+            st.pyplot(fig)
 
 # ================= STATUS UPDATE =================
 st.divider()
@@ -160,47 +156,38 @@ if not st.session_state.notice_register.empty:
     df = st.session_state.notice_register
 
     selected_index = st.selectbox(
-        "Select Notice (Ref ID / Source)",
+        "Select Notice to update",
         options=df.index,
         format_func=lambda x: f"{df.loc[x, 'Ref ID']} | {df.loc[x, 'Source']}"
     )
 
-    new_status = st.selectbox(
-        "Update Status",
-        STATUS_OPTIONS,
-        index=STATUS_OPTIONS.index(df.loc[selected_index, "Status"])
-    )
-
-    if st.button("Update Status"):
-        st.session_state.notice_register.loc[selected_index, "Status"] = new_status
-        st.session_state.notice_register.loc[selected_index, "Last Updated"] = \
+    col_a, col_b = st.columns(2)
+    with col_a:
+        new_status = st.selectbox(
+            "Update Status",
+            STATUS_OPTIONS,
+            index=STATUS_OPTIONS.index(df.loc[selected_index, "Status"])
+        )
+    
+    if st.button("Confirm Update"):
+        st.session_state.notice_register.at[selected_index, "Status"] = new_status
+        st.session_state.notice_register.at[selected_index, "Last Updated"] = \
             datetime.now().strftime("%d-%m-%Y %H:%M")
-
-        st.success("Status updated successfully")
+        st.success("Status updated!")
+        st.rerun()
 
 # ================= NOTICE HISTORY =================
 st.divider()
 with st.expander("📚 View Full Notice Register"):
     if not st.session_state.notice_register.empty:
-        st.dataframe(
-            st.session_state.notice_register,
-            use_container_width=True
-        )
+        st.dataframe(st.session_state.notice_register, use_container_width=True)
 
+        full_excel = to_excel(st.session_state.notice_register)
         st.download_button(
-            "📥 Download Full Register",
-            st.session_state.notice_register.to_excel(index=False),
-            file_name="GST_Litigation_Register.xlsx"
+            "📥 Download Full Register (Excel)",
+            data=full_excel,
+            file_name="GST_Litigation_Register_Full.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
-
-
-
-
-
-
-
-
-
-
-
+    else:
+        st.info("No notices uploaded yet.")
